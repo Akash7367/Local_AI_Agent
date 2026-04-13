@@ -2,6 +2,7 @@ import streamlit as st
 import os
 import json
 import tempfile
+import PyPDF2
 from dotenv import load_dotenv
 from groq import Groq
 
@@ -26,6 +27,8 @@ if "pending_filename" not in st.session_state:
     st.session_state.pending_filename = None
 if "pending_intent" not in st.session_state:
     st.session_state.pending_intent = None
+if "draft_transcription" not in st.session_state:
+    st.session_state.draft_transcription = None
 
 st.set_page_config(page_title="Voice-Controlled AI Agent", page_icon="🎙️", layout="wide")
 
@@ -76,54 +79,96 @@ with tab1:
         file_suffix = ""
 
 with tab2:
-    uploaded_file = st.file_uploader("Upload an audio file (.wav, .mp3, etc.)", type=["wav", "mp3", "m4a", "ogg", "flac"])
+    uploaded_file = st.file_uploader("Upload an audio file or PDF document", type=["wav", "mp3", "m4a", "ogg", "flac", "pdf"])
     if uploaded_file is not None:
-        final_audio_bytes = uploaded_file.read()
         file_suffix = "." + uploaded_file.name.split('.')[-1]
-        st.audio(final_audio_bytes, format=f"audio/{uploaded_file.name.split('.')[-1]}")
+        if file_suffix.lower() == ".pdf":
+            try:
+                pdf_reader = PyPDF2.PdfReader(uploaded_file)
+                pdf_text = ""
+                for page in pdf_reader.pages:
+                    if page.extract_text():
+                        pdf_text += page.extract_text() + "\n"
+                st.session_state.pdf_text_extracted = pdf_text
+                st.success(f"📄 PDF '{uploaded_file.name}' loaded successfully! Click Process Command to summarize it.")
+                final_audio_bytes = b"dummy"
+            except Exception as e:
+                st.error(f"Failed to read PDF: {e}")
+                final_audio_bytes = None
+        else:
+            final_audio_bytes = uploaded_file.read()
+            st.audio(final_audio_bytes, format=f"audio/{uploaded_file.name.split('.')[-1]}")
+
         
-if final_audio_bytes is not None:
+if final_audio_bytes is not None and not st.session_state.get("draft_transcription"):
     col_btn1, col_btn2 = st.columns([1, 4])
     with col_btn1:
-        if st.button("🚀 Process Command", type="primary"):
-            process_clicked = True
+        if st.button("📝 Transcribe / Extract", type="primary"):
+            transcribe_clicked = True
         else:
-            process_clicked = False
+            transcribe_clicked = False
             
     with col_btn2:
         if st.button("🗑️ Discard & Re-Record"):
             st.session_state.audio_key += 1
             st.rerun()
             
-    if process_clicked:
-        with st.spinner("Processing..."):
+    if transcribe_clicked:
+        with st.spinner("Extracting text..."):
             if not api_key:
                 st.error("Error: Groq API Key is missing. Please enter it in the settings or .env file.")
                 st.stop()
-            
             try:
                 client = Groq(api_key=api_key)
             except Exception as e:
                 st.error(f"Error initializing Groq client: {str(e)}")
                 st.stop()
             
-            # Save audio to a temporary file since local whisper and some STT tools need a filepath
-            with tempfile.NamedTemporaryFile(delete=False, suffix=file_suffix) as tmp_file:
-                tmp_file.write(final_audio_bytes)
-                audio_filepath = tmp_file.name
-
-            # Make columns for the results
-            col1, col2 = st.columns(2)
-
-            with col1:
-                # 1. Speech-to-Text
-                st.subheader("📝 Transcription")
+            if file_suffix.lower() == ".pdf":
+                transcription = f"Please provide a concise summary of the following document:\n\n{st.session_state.pdf_text_extracted[:20000]}"
+            else:
+                with tempfile.NamedTemporaryFile(delete=False, suffix=file_suffix) as tmp_file:
+                    tmp_file.write(final_audio_bytes)
+                    audio_filepath = tmp_file.name
                 if stt_engine_choice == "Groq API (Fast)":
                     transcription = transcribe_audio_groq(client, audio_filepath)
                 else:
                     transcription = transcribe_audio_local(audio_filepath)
-                
-                st.info(transcription)
+                if os.path.exists(audio_filepath):
+                    os.remove(audio_filepath)
+            
+            st.session_state.draft_transcription = transcription
+            st.rerun()
+
+if st.session_state.get("draft_transcription"):
+    st.markdown("### 2. Review and Edit Command")
+    edited_text = st.text_area("Edit text before agent processes it:", value=st.session_state.draft_transcription, height=150)
+    
+    col_proc1, col_proc2 = st.columns([1, 4])
+    with col_proc1:
+        if st.button("🚀 Confirm & Execute", type="primary"):
+            process_clicked = True
+        else:
+            process_clicked = False
+    with col_proc2:
+        if st.button("❌ Cancel Edit"):
+            st.session_state.draft_transcription = None
+            st.rerun()
+            
+    if process_clicked:
+        transcription = edited_text
+        with st.spinner("Processing Intent..."):
+            if not api_key:
+                st.error("Missing Groq API Key")
+                st.stop()
+            client = Groq(api_key=api_key)
+            col1, col2 = st.columns(2)
+            with col1:
+                st.subheader("📝 Final Input")
+                if file_suffix.lower() == ".pdf":
+                    st.info(f"[PDF Input Verified - Proceeding to Summation]")
+                else:
+                    st.info(transcription)
 
             if transcription.startswith("Error"):
                 st.error("Failed to transcribe audio.")
@@ -163,8 +208,8 @@ if final_audio_bytes is not None:
                         "result": memory_result
                     })
 
-            # Clean up the temp file
-            os.remove(audio_filepath)
+            # Reset draft after processing
+            st.session_state.draft_transcription = None
             
 # --- Human-in-the-loop Alert ---
 if st.session_state.get("pending_alert"):
